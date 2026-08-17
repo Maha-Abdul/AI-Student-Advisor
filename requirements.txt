@@ -1,0 +1,9 @@
+gradio
+openai-whisper
+sentence-transformers
+faiss-cpu
+pypdf
+beautifulsoup4
+requests
+transformers
+torch
