@@ -32,6 +32,18 @@ def read_pdf(file_path):
     return pages
 
 
+def read_txt(file_path):
+    text = file_path.read_text(encoding="utf-8")
+
+    return [
+        {
+            "text": text,
+            "source": file_path.name,
+            "page": None,
+        }
+    ]
+
+
 def chunk_text(text, chunk_size=500, overlap=100):
     chunks = []
 
@@ -51,8 +63,16 @@ def chunk_text(text, chunk_size=500, overlap=100):
 def load_documents():
     documents = []
 
-    for pdf_file in DATA_DIR.glob("*.pdf"):
-        pages = read_pdf(pdf_file)
+    for file_path in DATA_DIR.iterdir():
+
+        if file_path.suffix.lower() == ".pdf":
+            pages = read_pdf(file_path)
+
+        elif file_path.suffix.lower() == ".txt":
+            pages = read_txt(file_path)
+
+        else:
+            continue
 
         for page in pages:
             chunks = chunk_text(page["text"])
@@ -81,7 +101,6 @@ def create_index(documents):
     dimension = embeddings.shape[1]
 
     index = faiss.IndexFlatIP(dimension)
-
     index.add(embeddings)
 
     faiss.write_index(index, INDEX_FILE)
@@ -96,6 +115,6 @@ if __name__ == "__main__":
     documents = load_documents()
 
     if not documents:
-        print("No PDF files found in the data folder.")
+        print("No PDF or TXT files found in the data folder.")
     else:
         create_index(documents)
