@@ -1,36 +1,67 @@
-"""
-AI Student Advisor
-Main application entry point.
-
-This application will allow students to:
-1. Ask questions by text or voice.
-2. Retrieve information from institutional catalogs and websites.
-3. Generate answers only from retrieved official information.
-4. Provide contact information when an answer cannot be verified.
-"""
-
 import gradio as gr
+
+from rag import retrieve
+
+
+CONTACT_EMAIL = "admissions@example.edu"
+CONTACT_PHONE = "703-555-1234"
+
+MIN_SCORE = 0.45
+
+
+def format_source(result):
+    source = result["source"]
+    page = result["page"]
+
+    if page:
+        return f"{source}, page {page}"
+
+    return source
 
 
 def answer_question(question):
-    """
-    Temporary function.
+    question = question.strip()
 
-    The real RAG retrieval system will be connected here
-    after we build rag.py and ingest.py.
-    """
-    return f"You asked: {question}"
+    if not question:
+        return "Please enter a question."
+
+    results = retrieve(question, top_k=3)
+
+    if not results:
+        return (
+            "I could not find reliable information in the official resources. "
+            f"Please contact us at {CONTACT_EMAIL} or {CONTACT_PHONE}."
+        )
+
+    best_result = results[0]
+
+    if best_result["score"] < MIN_SCORE:
+        return (
+            "I could not verify that answer from the official resources. "
+            f"Please contact us at {CONTACT_EMAIL} or {CONTACT_PHONE}."
+        )
+
+    context = best_result["text"]
+    source = format_source(best_result)
+
+    return (
+        f"{context}\n\n"
+        f"Source: {source}"
+    )
 
 
 demo = gr.Interface(
     fn=answer_question,
     inputs=gr.Textbox(
         label="Ask the AI Student Advisor",
-        placeholder="Ask about programs, admissions, tuition, or student services..."
+        placeholder="Example: Do you offer an Artificial Intelligence program?"
     ),
     outputs=gr.Textbox(label="Answer"),
     title="AI Student Advisor",
-    description="Voice and RAG-powered institutional student information assistant."
+    description=(
+        "Ask questions about programs, admissions, tuition, "
+        "student services, and institutional information."
+    )
 )
 
 
