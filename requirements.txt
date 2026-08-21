@@ -6,6 +6,5 @@ faiss-cpu
 pypdf
 beautifulsoup4
 requests
-transformers
 torch
 edge-tts
