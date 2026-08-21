@@ -1,26 +1,58 @@
 import asyncio
 import os
+import re
 import tempfile
 from functools import lru_cache
 from pathlib import Path
 
 import edge_tts
 import gradio as gr
+import torch
 import whisper
 from openai import OpenAI
+from sentence_transformers import CrossEncoder
 
 from rag import build_context, retrieve
 
 
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
+
 CONTACT_EMAIL = "info@NATI.edu"
 CONTACT_PHONE = "833-228-1010"
 
-MIN_SCORE = 0.40
-
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
-TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AriaNeural")
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-JennyNeural")
 
+# Retrieve more candidates first
+RETRIEVAL_TOP_K = 10
+
+# After reranking, only send strongest passages to OpenAI
+RERANK_TOP_K = 4
+
+# Minimum acceptable reranker confidence
+MIN_RERANK_SCORE = 0.18
+
+
+# ---------------------------------------------------------
+# OPENAI CLIENT
+# ---------------------------------------------------------
+
+def get_openai_client():
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. "
+            "Add it as a Hugging Face Space secret."
+        )
+
+    return OpenAI()
+
+
+# ---------------------------------------------------------
+# WHISPER
+# ---------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def get_whisper_model():
@@ -38,6 +70,48 @@ def transcribe_audio(audio_path):
 
     return result.get("text", "").strip()
 
+
+# ---------------------------------------------------------
+# CROSS ENCODER RERANKER
+# ---------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def get_reranker():
+    return CrossEncoder(
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        activation_fn=torch.nn.Sigmoid()
+    )
+
+
+def rerank_results(question, results):
+    if not results:
+        return []
+
+    pairs = [
+        [question, result.get("text", "")]
+        for result in results
+    ]
+
+    scores = get_reranker().predict(pairs)
+
+    ranked = []
+
+    for result, score in zip(results, scores):
+        item = dict(result)
+        item["rerank_score"] = float(score)
+        ranked.append(item)
+
+    ranked.sort(
+        key=lambda x: x["rerank_score"],
+        reverse=True
+    )
+
+    return ranked
+
+
+# ---------------------------------------------------------
+# SOURCE FORMATTING
+# ---------------------------------------------------------
 
 def format_source(result):
     source = result.get("source") or "NATI official resource"
@@ -65,54 +139,27 @@ def format_references(results):
             references.append(reference)
 
     return "\n".join(
-        f"{number}. {reference}"
-        for number, reference in enumerate(references, start=1)
+        f"- {reference}"
+        for reference in references
     )
 
 
-def grounded_answer(question, results):
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set. "
-            "Add it as a Hugging Face Space secret."
-        )
+# ---------------------------------------------------------
+# SMALL TALK
+# ---------------------------------------------------------
 
-    context = build_context(results)
+def normalize_text(text):
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s']", "", text)
+    text = re.sub(r"\s+", " ", text)
 
-    client = OpenAI()
-
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        instructions=(
-            "You are the NATI AI Student Advisor. "
-            "Answer using only the NATI context supplied to you. "
-            "Do not use outside knowledge. "
-            "Never invent facts. "
-            "Give a direct, natural answer in no more than three short sentences. "
-            "Do not include citations, URLs, source labels, copyright notices, "
-            "page numbers, headings, or contact details in the answer. "
-            "If the supplied context does not support the answer, say exactly: "
-            "'I could not verify that from NATI's official resources.'"
-        ),
-        input=(
-            f"QUESTION:\n{question}\n\n"
-            f"NATI CONTEXT:\n{context}"
-        ),
-        max_output_tokens=180,
-    )
-
-    answer = response.output_text.strip()
-
-    if not answer:
-        raise RuntimeError("OpenAI returned an empty answer.")
-
-    return answer
+    return text.strip()
 
 
 def is_small_talk(question):
-    text = question.lower().strip()
+    text = normalize_text(question)
 
-    small_talk_phrases = [
+    phrases = [
         "hi",
         "hello",
         "hey",
@@ -120,7 +167,7 @@ def is_small_talk(question):
         "good afternoon",
         "good evening",
         "how are you",
-        "how are you?",
+        "how are you doing",
         "thanks",
         "thank you",
         "thank you very much",
@@ -131,30 +178,29 @@ def is_small_talk(question):
         "whats up"
     ]
 
-    return text in small_talk_phrases
+    return text in phrases
 
 
-def small_talk_answer(question):
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set. "
-            "Add it as a Hugging Face Space secret."
-        )
+def small_talk_answer(question, memory):
+    client = get_openai_client()
 
-    client = OpenAI()
+    recent_memory = memory[-6:] if memory else []
 
     response = client.responses.create(
         model=OPENAI_MODEL,
         instructions=(
             "You are the NATI AI Student Advisor. "
-            "This is casual conversation, not a document search. "
-            "Respond naturally, warmly, and briefly. "
+            "Respond naturally and briefly to greetings, thanks, "
+            "goodbyes, or casual conversation. "
             "Use no more than two short sentences. "
-            "If appropriate, invite the user to ask a question about NATI. "
-            "Do not include sources or references."
+            "Do not include sources. "
+            "When appropriate, invite the user to ask about NATI."
         ),
-        input=question,
-        max_output_tokens=80,
+        input=(
+            f"Recent conversation:\n{recent_memory}\n\n"
+            f"User:\n{question}"
+        ),
+        max_output_tokens=80
     )
 
     answer = response.output_text.strip()
@@ -164,6 +210,108 @@ def small_talk_answer(question):
 
     return answer
 
+
+# ---------------------------------------------------------
+# SEMANTIC QUERY REWRITING
+# ---------------------------------------------------------
+
+def build_semantic_query(question, memory):
+    client = get_openai_client()
+
+    recent_memory = memory[-6:] if memory else []
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=(
+            "Rewrite the user's message into one short standalone search query "
+            "for NATI's official catalog and website. "
+            "Preserve the user's intended meaning, not just their exact wording. "
+            "Resolve synonyms and related meanings. "
+            "Examples: "
+            "'where are you located', 'campus location', 'address', and "
+            "'where is NATI' all mean NATI campus/contact address. "
+            "'cost', 'price', and 'how much' may mean tuition or fees depending "
+            "on conversation context. "
+            "Use conversation history only to resolve references such as "
+            "'that program', 'it', 'that course', or 'there'. "
+            "Do not answer the question. "
+            "Return only the rewritten search query."
+        ),
+        input=(
+            f"Conversation history:\n{recent_memory}\n\n"
+            f"Latest user message:\n{question}"
+        ),
+        max_output_tokens=80
+    )
+
+    rewritten = response.output_text.strip()
+
+    return rewritten if rewritten else question
+
+
+# ---------------------------------------------------------
+# EVIDENCE VALIDATION
+# ---------------------------------------------------------
+
+def evidence_is_strong(ranked_results):
+    if not ranked_results:
+        return False
+
+    best_score = ranked_results[0].get("rerank_score", 0)
+
+    return best_score >= MIN_RERANK_SCORE
+
+
+# ---------------------------------------------------------
+# GROUNDED ANSWER
+# ---------------------------------------------------------
+
+def grounded_answer(question, results, memory):
+    client = get_openai_client()
+
+    context = build_context(results)
+    recent_memory = memory[-6:] if memory else []
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=(
+            "You are the NATI AI Student Advisor. "
+            "Answer factual NATI questions using only the supplied NATI context. "
+            "Conversation history may only be used to understand what the user "
+            "is referring to. "
+            "Do not use outside knowledge. "
+            "Never invent, infer, or guess facts that are not explicitly supported "
+            "by the NATI context. "
+            "For addresses, campus locations, phone numbers, tuition amounts, "
+            "dates, program names, accreditation, policies, and other exact facts, "
+            "only state them if they appear clearly in the supplied context. "
+            "If multiple sources conflict, do not choose one silently. "
+            "Say that the information could not be verified. "
+            "Give a direct, natural answer in no more than three short sentences. "
+            "Do not include source labels, URLs, page numbers, citations, "
+            "copyright notices, or headings in the answer. "
+            "If the context does not clearly support the answer, say exactly: "
+            "'I could not verify that from NATI's official resources.'"
+        ),
+        input=(
+            f"Conversation history:\n{recent_memory}\n\n"
+            f"User question:\n{question}\n\n"
+            f"NATI CONTEXT:\n{context}"
+        ),
+        max_output_tokens=180
+    )
+
+    answer = response.output_text.strip()
+
+    if not answer:
+        raise RuntimeError("OpenAI returned an empty answer.")
+
+    return answer
+
+
+# ---------------------------------------------------------
+# TEXT TO SPEECH
+# ---------------------------------------------------------
 
 async def create_speech_file(answer):
     with tempfile.NamedTemporaryFile(
@@ -175,7 +323,8 @@ async def create_speech_file(answer):
 
     communicator = edge_tts.Communicate(
         answer,
-        TTS_VOICE
+        TTS_VOICE,
+        rate="-3%"
     )
 
     await communicator.save(str(output_path))
@@ -189,38 +338,61 @@ def text_to_speech(answer):
     )
 
 
-def answer_question(audio_path, typed_question):
-    try:
-        if audio_path:
-            question = transcribe_audio(audio_path)
-        else:
-            question = (typed_question or "").strip()
+# ---------------------------------------------------------
+# MAIN CONVERSATION ENGINE
+# ---------------------------------------------------------
 
-    except Exception as error:
-        return (
-            "",
-            f"I could not understand the recording: {error}",
-            "",
-            None
-        )
+def process_question(question, chat_history, memory):
+    chat_history = chat_history or []
+    memory = memory or []
+
+    question = (question or "").strip()
 
     if not question:
-        return (
-            "",
-            "Please record a question or type one below.",
-            "",
-            None
-        )
+        return chat_history, memory, None
+
+    # Add user message
+    chat_history.append(
+        {
+            "role": "user",
+            "content": question
+        }
+    )
+
+    memory.append(
+        {
+            "role": "user",
+            "content": question
+        }
+    )
 
     # -----------------------------------------------------
     # SMALL TALK
     # -----------------------------------------------------
 
     if is_small_talk(question):
+
         try:
-            answer = small_talk_answer(question)
-        except Exception as error:
-            answer = f"Hi! How can I help you with NATI today?"
+            answer = small_talk_answer(
+                question,
+                memory
+            )
+        except Exception:
+            answer = "Hi! How can I help you with NATI today?"
+
+        chat_history.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
+
+        memory.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
 
         try:
             audio_output = text_to_speech(answer)
@@ -228,34 +400,91 @@ def answer_question(audio_path, typed_question):
             audio_output = None
 
         return (
-            question,
-            answer,
-            "",
+            chat_history,
+            memory,
             audio_output
         )
 
     # -----------------------------------------------------
-    # NATI RAG RETRIEVAL
+    # SEMANTIC QUERY
     # -----------------------------------------------------
 
     try:
-        results = retrieve(
+        search_query = build_semantic_query(
             question,
-            top_k=3
+            memory
+        )
+    except Exception:
+        search_query = question
+
+    # -----------------------------------------------------
+    # RETRIEVE MORE CANDIDATES
+    # -----------------------------------------------------
+
+    try:
+        raw_results = retrieve(
+            search_query,
+            top_k=RETRIEVAL_TOP_K
         )
 
-    except Exception as error:
+    except Exception:
+
+        answer = (
+            "I encountered a problem while searching NATI's resources."
+        )
+
+        chat_history.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
+
+        memory.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
+
         return (
-            question,
-            f"The NATI retrieval system encountered an error: {error}",
-            "",
+            chat_history,
+            memory,
             None
         )
 
-    if not results or results[0].get("score", 0) < MIN_SCORE:
+    # -----------------------------------------------------
+    # SEMANTIC RERANKING
+    # -----------------------------------------------------
+
+    try:
+        ranked_results = rerank_results(
+            search_query,
+            raw_results
+        )
+    except Exception:
+        ranked_results = raw_results
+
+    if not evidence_is_strong(ranked_results):
+
         answer = (
             "I could not verify that from NATI's official resources. "
-            f"Please contact NATI at {CONTACT_EMAIL} or {CONTACT_PHONE}."
+            f"Please contact NATI at {CONTACT_EMAIL} "
+            f"or {CONTACT_PHONE}."
+        )
+
+        chat_history.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
+
+        memory.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
         )
 
         try:
@@ -264,118 +493,196 @@ def answer_question(audio_path, typed_question):
             audio_output = None
 
         return (
-            question,
-            answer,
-            "No sufficiently relevant NATI source was found.",
+            chat_history,
+            memory,
             audio_output
         )
 
-    references = format_references(results)
+    best_results = ranked_results[:RERANK_TOP_K]
+
+    # -----------------------------------------------------
+    # GENERATE GROUNDED ANSWER
+    # -----------------------------------------------------
 
     try:
         answer = grounded_answer(
             question,
-            results
+            best_results,
+            memory
         )
 
-    except Exception as error:
-        return (
-            question,
-            f"I could not create the answer: {error}",
-            references,
-            None
-        )
+    except Exception:
+        answer = "I could not generate the answer right now."
+
+    references = format_references(
+        best_results
+    )
+
+    display_answer = (
+        f"{answer}\n\n"
+        f"**Source:**\n"
+        f"{references}"
+    )
+
+    chat_history.append(
+        {
+            "role": "assistant",
+            "content": display_answer
+        }
+    )
+
+    memory.append(
+        {
+            "role": "assistant",
+            "content": answer
+        }
+    )
+
+    # -----------------------------------------------------
+    # SPEAK ANSWER ONLY
+    # -----------------------------------------------------
 
     try:
         audio_output = text_to_speech(answer)
 
-    except Exception as error:
-        return (
-            question,
-            answer,
-            references + f"\n\nVoice error: {error}",
-            None
-        )
+    except Exception:
+        audio_output = None
 
     return (
-        question,
-        answer,
-        references,
+        chat_history,
+        memory,
         audio_output
     )
 
 
-with gr.Blocks(title="NATI AI Student Advisor") as demo:
+# ---------------------------------------------------------
+# TEXT HANDLER
+# ---------------------------------------------------------
+
+def handle_text(message, chat_history, memory):
+    updated_chat, updated_memory, audio_output = process_question(
+        message,
+        chat_history,
+        memory
+    )
+
+    return (
+        "",
+        updated_chat,
+        updated_memory,
+        audio_output
+    )
+
+
+# ---------------------------------------------------------
+# VOICE HANDLER
+# ---------------------------------------------------------
+
+def handle_voice(audio_path, chat_history, memory):
+    if not audio_path:
+        return (
+            chat_history,
+            memory,
+            None,
+            None
+        )
+
+    try:
+        question = transcribe_audio(audio_path)
+    except Exception:
+        question = ""
+
+    updated_chat, updated_memory, audio_output = process_question(
+        question,
+        chat_history,
+        memory
+    )
+
+    return (
+        updated_chat,
+        updated_memory,
+        audio_output,
+        None
+    )
+
+
+# ---------------------------------------------------------
+# UI
+# ---------------------------------------------------------
+
+with gr.Blocks(
+    title="NATI AI Student Advisor"
+) as demo:
 
     gr.Markdown(
-        "# NATI AI Student Advisor\n\n"
-        "Ask a question by voice or text.\n\n"
-        "For voice questions, record your question and stop recording. "
-        "The advisor will automatically process it and respond."
+        """
+# 🎓 NATI AI Student Advisor
+
+Ask naturally by **voice or text**.
+
+🎤 **Record → Speak → Stop → Automatic AI Response**
+
+Answers are grounded in NATI's official catalog and website.
+"""
     )
 
-    with gr.Row():
+    memory_state = gr.State([])
 
-        microphone = gr.Audio(
-            sources=["microphone"],
-            type="filepath",
-            label="Speak your question"
-        )
-
-        typed_question = gr.Textbox(
-            label="Or type your question",
-            placeholder="Example: What are the admission requirements?",
-            lines=3
-        )
-
-    transcript = gr.Textbox(
-        label="What You Said",
-        interactive=False
+    chatbot = gr.Chatbot(
+        value=[
+            {
+                "role": "assistant",
+                "content": "Hi! How can I help you with NATI today?"
+            }
+        ],
+        height=500
     )
 
-    answer = gr.Textbox(
-        label="Answer",
-        lines=5,
-        interactive=False
+    text_input = gr.Textbox(
+        placeholder="Type a message and press Enter...",
+        label="Message",
+        lines=1
     )
 
-    references = gr.Textbox(
-        label="Source / Reference",
-        lines=4,
-        interactive=False
+    microphone = gr.Audio(
+        sources=["microphone"],
+        type="filepath",
+        label="🎤 Speak"
     )
 
     spoken_answer = gr.Audio(
-        label="Spoken Answer",
+        label="Voice Response",
         autoplay=True,
         interactive=False
     )
 
-    microphone.stop_recording(
-        fn=answer_question,
+    text_input.submit(
+        fn=handle_text,
         inputs=[
-            microphone,
-            typed_question
+            text_input,
+            chatbot,
+            memory_state
         ],
         outputs=[
-            transcript,
-            answer,
-            references,
+            text_input,
+            chatbot,
+            memory_state,
             spoken_answer
         ]
     )
 
-    typed_question.submit(
-        fn=answer_question,
+    microphone.stop_recording(
+        fn=handle_voice,
         inputs=[
             microphone,
-            typed_question
+            chatbot,
+            memory_state
         ],
         outputs=[
-            transcript,
-            answer,
-            references,
-            spoken_answer
+            chatbot,
+            memory_state,
+            spoken_answer,
+            microphone
         ]
     )
 
